@@ -2,12 +2,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from telethon import TelegramClient
-from telethon.sessions import StringSession
+from pyrogram import Client as PyrogramClient
 import os
 import time
 import hashlib
 
-app = FastAPI(title="Telegram Session API")
+app = FastAPI(title="SQLite Telegram Session API")
 
 # Setup caching directory and expiry time (30 minutes)
 CACHE_DIR = "session_cache"
@@ -18,48 +18,61 @@ class SessionRequest(BaseModel):
     api_id: int
     api_hash: str
     bot_token: str
-    library: str = "telethon"
+    library: str = "telethon" # Accepts "telethon" or "pyrogram"
 
 @app.post("/generate")
 async def generate_session(req: SessionRequest):
-    if req.library.lower() != "telethon":
-        raise HTTPException(status_code=400, detail="Only 'telethon' is supported right now.")
+    lib = req.library.lower()
+    if lib not in ["telethon", "pyrogram"]:
+        raise HTTPException(status_code=400, detail="Library must be 'telethon' or 'pyrogram'")
 
-    # Create a unique filename hash based on the bot token
-    token_hash = hashlib.md5(req.bot_token.encode()).hexdigest()
-    file_path = os.path.join(CACHE_DIR, f"{token_hash}.session")
+    # Create a unique filename hash based on the bot token AND the library
+    hash_str = f"{req.bot_token}_{lib}"
+    token_hash = hashlib.md5(hash_str.encode()).hexdigest()
+    
+    # Path handling: The clients will automatically append ".session"
+    session_base_path = os.path.join(CACHE_DIR, token_hash)
+    file_path = f"{session_base_path}.session"
 
-    # 1. Check Cache: Does the file exist and is it under 30 minutes old?
+    # 1. Check Cache
     if os.path.exists(file_path):
         file_age = time.time() - os.path.getmtime(file_path)
         if file_age < CACHE_EXPIRY:
             return FileResponse(
                 path=file_path, 
-                filename="string.session", 
-                media_type="text/plain"
+                filename=f"{lib}_bot.session", 
+                media_type="application/octet-stream" # Triggers a binary file download
             )
         else:
-            # Delete expired session file
+            # Delete expired SQLite session file
             os.remove(file_path)
 
-    # 2. Generate New Session
-    client = TelegramClient(StringSession(), req.api_id, req.api_hash)
-    
+    # 2. Generate New SQLite Session
     try:
-        # Start the client using the bot token
-        await client.start(bot_token=req.bot_token)
-        session_string = client.session.save()
-        await client.disconnect()
+        if lib == "telethon":
+            # Passing a file path directly creates an SQLite database there
+            client = TelegramClient(session_base_path, req.api_id, req.api_hash)
+            await client.start(bot_token=req.bot_token)
+            await client.disconnect() # Crucial: Disconnect to save and unlock the DB file
+            
+        elif lib == "pyrogram":
+            # workdir ensures the SQLite file goes into our cache folder
+            client = PyrogramClient(
+                name=token_hash, 
+                workdir=CACHE_DIR,
+                api_id=req.api_id, 
+                api_hash=req.api_hash, 
+                bot_token=req.bot_token
+            )
+            await client.start()
+            await client.stop() # Crucial: Stop to save and unlock the DB file
+            
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Telegram API Error: {str(e)}")
 
-    # 3. Save to Cache
-    with open(file_path, "w") as f:
-        f.write(session_string)
-
-    # 4. Return as a downloadable file
+    # 3. Return the generated SQLite database file
     return FileResponse(
         path=file_path, 
-        filename="string.session", 
-        media_type="text/plain"
+        filename=f"{lib}_bot.session", 
+        media_type="application/octet-stream"
     )
